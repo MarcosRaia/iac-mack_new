@@ -1,0 +1,82 @@
+---
+- name: Criar Application Load Balancer
+  hosts: localhost
+  gather_facts: no
+  collections:
+    - community.aws
+    - amazon.aws
+  tasks:
+    - name: Carregar variáveis de ambiente do .bashrc
+      shell: /bin/bash -c 'source ~/.bashrc && env'
+      register: shell_output
+
+    - name: Exibir conteúdo do shell_output
+      debug:
+        var: shell_output.stdout_lines
+
+    - name: Setar variáveis de ambiente
+      set_fact:
+        security_group_id: "{{ (shell_output.stdout_lines | select('search', '^SG_ID=') | list | first | split('=') | last) | default('') }}"
+        subnet_id_az1: "{{ (shell_output.stdout_lines | select('search', '^SUBNET_ID_AZ1=') | list | first | split('=') | last) | default('') }}"
+        subnet_id_az2: "{{ (shell_output.stdout_lines | select('search', '^SUBNET_ID_AZ2=') | list | first | split('=') | last) | default('') }}"
+        asg_name: "{{ (shell_output.stdout_lines | select('search', '^ASG_NAME=') | list | first | split('=') | last) | default('') }}"
+        region: "{{ (lookup('ini', 'AWS_DEFAULT_REGION section=default file=~/.aws/credentials') | default('')) }}"
+        vpc_id: "{{ (shell_output.stdout_lines | select('search', '^VPC_ID=') | list | first | split('=') | last) | default('') }}"
+
+    - name: Verificar se as variáveis estão definidas
+      fail:
+        msg: "As variáveis security_group_id, subnet_id_az1, subnet_id_az2, asg_name, region ou vpc_id estão vazias!"
+      when: security_group_id == "" or subnet_id_az1 == "" or subnet_id_az2 == "" or asg_name == "" or region == "" or vpc_id == ""
+
+    - name: Criar Target Group
+      community.aws.elb_target_group:
+        name: "webserver-tg"
+        protocol: HTTP
+        port: 80
+        vpc_id: "{{ vpc_id }}"
+        health_check_protocol: HTTP
+        health_check_port: 80
+        health_check_path: /
+        region: "{{ region }}"
+        state: present
+      register: target_group
+
+    - name: Criar Load Balancer
+      community.aws.elb_application_lb:
+        name: "webserver-alb"
+        state: present
+        security_groups: [ "{{ security_group_id }}" ]
+        subnets: [ "{{ subnet_id_az1 }}", "{{ subnet_id_az2 }}" ]
+        scheme: internet-facing
+        listeners:
+          - Protocol: HTTP
+            Port: 80
+            DefaultActions:
+              - Type: forward
+                TargetGroupArn: "{{ target_group.target_group_arn }}"
+        region: "{{ region }}"
+      register: alb
+
+    - name: Associar Target Group ao Auto Scaling Group
+      community.aws.autoscaling_group:
+        name: "{{ asg_name }}"
+        target_group_arns: [ "{{ target_group.target_group_arn }}" ]
+        region: "{{ region }}"
+        state: present
+
+    - name: Exibir detalhes do Load Balancer
+      debug:
+        var: alb
+
+    - name: Exportar Load Balancer DNS name para .bashrc
+      lineinfile:
+        path: ~/.bashrc
+        line: "export ALB_DNS_NAME={{ alb.dns_name }}"
+        create: yes
+
+    - name: Carregar novas variáveis de ambiente do .bashrc
+      shell: /bin/bash -c 'source ~/.bashrc'
+
+    - name: Variáveis de ambiente carregadas com sucesso!
+      debug:
+        msg: "ALB_DNS_NAME: {{ lookup('env', 'ALB_DNS_NAME') }}"

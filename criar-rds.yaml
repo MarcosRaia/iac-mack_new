@@ -1,0 +1,141 @@
+---
+- name: Criar RDS na AWS
+  hosts: localhost
+  gather_facts: no
+  collections:
+    - amazon.aws
+  tasks:
+    - name: Carregar variáveis de ambiente do .bashrc
+      shell: . ~/.bashrc && env
+      register: shell_output
+      ignore_errors: yes
+
+    - name: Verificar se as variáveis foram carregadas corretamente
+      debug:
+        var: shell_output.stdout_lines
+
+    - name: Extrair VPC_ID
+      set_fact:
+        vpc_id: "{{ item.split('=')[1] }}"
+      with_items: "{{ shell_output.stdout_lines }}"
+      when: "'VPC_ID=' in item"
+
+    - name: Extrair SUBNET_ID_AZ1
+      set_fact:
+        subnet_id_az1: "{{ item.split('=')[1] }}"
+      with_items: "{{ shell_output.stdout_lines }}"
+      when: "'SUBNET_ID_AZ1=' in item"
+
+    - name: Extrair SUBNET_ID_AZ2
+      set_fact:
+        subnet_id_az2: "{{ item.split('=')[1] }}"
+      with_items: "{{ shell_output.stdout_lines }}"
+      when: "'SUBNET_ID_AZ2=' in item"
+
+    - name: Extrair SG_ID
+      set_fact:
+        security_group_id: "{{ item.split('=')[1] }}"
+      with_items: "{{ shell_output.stdout_lines }}"
+      when: "'SG_ID=' in item"
+
+    - name: Setar região
+      set_fact:
+        region: "{{ lookup('ini', 'AWS_DEFAULT_REGION section=default file=~/.aws/credentials') }}"
+
+    - name: Verificar se as variáveis foram setadas corretamente
+      debug:
+        msg: "VPC_ID: {{ vpc_id }}, SUBNET_ID_AZ1: {{ subnet_id_az1 }}, SUBNET_ID_AZ2: {{ subnet_id_az2 }}, SG_ID: {{ security_group_id }}, REGION: {{ region }}"
+
+    - name: Criar grupo de segurança para RDS
+      amazon.aws.ec2_group:
+        name: "rds-security-group"
+        description: "Security group for RDS instance"
+        vpc_id: "{{ vpc_id }}"
+        rules:
+          - proto: tcp
+            ports:
+              - 3306
+            cidr_ip: 0.0.0.0/0
+        region: "{{ region }}"
+        state: present
+      register: rds_sg
+
+    - name: Adicionar regra de entrada para SG_ID no grupo de segurança do RDS
+      amazon.aws.ec2_group:
+        name: "{{ rds_sg.group_name }}"
+        description: "Allow access from SG_ID"
+        vpc_id: "{{ vpc_id }}"
+        rules:
+          - proto: tcp
+            ports:
+              - 3306
+            group_id: "{{ security_group_id }}"
+        region: "{{ region }}"
+        state: present
+
+    - name: Criar DB Subnet Group
+      amazon.aws.rds_subnet_group:
+        name: "my-subnet-group"
+        description: "Subnet group for RDS instances"
+        subnets:
+          - "{{ subnet_id_az1 }}"
+          - "{{ subnet_id_az2 }}"
+        region: "{{ region }}"
+        state: present
+      register: db_subnet_group
+
+    - name: Exportar DB Subnet Group name para .bashrc
+      lineinfile:
+        path: ~/.bashrc
+        line: "export DB_SUBNET_GROUP_NAME=my-subnet-group"
+        create: yes
+
+    - name: Carregar novas variáveis de ambiente do .bashrc
+      shell: . ~/.bashrc && env
+      register: new_shell_output
+
+    - name: Verificar se a variável DB_SUBNET_GROUP_NAME foi carregada corretamente
+      debug:
+        var: new_shell_output.stdout_lines
+
+    - name: Criar RDS instance
+      amazon.aws.rds_instance:
+        db_instance_identifier: "webserver-db"
+        db_name: "webserverdb"
+        allocated_storage: 20
+        db_instance_class: db.t3.micro
+        engine: mysql
+        master_username: "admin"
+        master_user_password: "password"
+        vpc_security_group_ids:
+          - "{{ rds_sg.group_id }}"
+        db_subnet_group_name: "{{ lookup('env', 'DB_SUBNET_GROUP_NAME') }}"
+        multi_az: no
+        region: "{{ region }}"
+        state: present
+        tags:
+          Name: "webserver-db"
+      register: rds
+
+    - name: Exibir detalhes da RDS criada
+      debug:
+        var: rds
+
+    - name: Remover variável RDS_ENDPOINT existente do .bashrc
+      lineinfile:
+        path: ~/.bashrc
+        state: absent
+        regexp: '^export RDS_ENDPOINT='
+
+    - name: Exportar RDS endpoint para .bashrc
+      lineinfile:
+        path: ~/.bashrc
+        line: "export RDS_ENDPOINT={{ rds.endpoint }}"
+        create: yes
+
+    - name: Carregar novas variáveis de ambiente do .bashrc
+      shell: . ~/.bashrc
+
+    - name: Variáveis de ambiente carregadas com sucesso!
+      debug:
+        msg: "RDS_ENDPOINT: {{ lookup('env', 'RDS_ENDPOINT') }}"
